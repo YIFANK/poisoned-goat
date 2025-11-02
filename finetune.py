@@ -20,6 +20,7 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
+from peft import PeftModel
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from utils.prompter import Prompter
@@ -30,7 +31,7 @@ def train(
     base_model: str = "",  # Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'
     data_path: str = "dataset.json",
     output_dir: str = "./weights",
-    
+    lora_weights_path: str = "tiedong/goat-lora-7b",
     # training hyperparams
     batch_size: int = 128,
     micro_batch_size: int = 16,
@@ -173,6 +174,10 @@ def train(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, config)
+
+    # load lora weights
+    if lora_weights_path:
+        model = PeftModel.from_pretrained(model, lora_weights_path)
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)

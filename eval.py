@@ -83,39 +83,93 @@ def evaluate(
     print(f"Loading base model: {base_model}")
     print(f"Loading LoRA weights: {lora_weights}")
     
+    # Check if lora_weights is a local path and exists
+    if not lora_weights.startswith(("http://", "https://")) and "/" in lora_weights and not os.path.exists(lora_weights):
+        # Check if it's a relative path
+        if not os.path.isabs(lora_weights):
+            abs_path = os.path.abspath(lora_weights)
+            if os.path.exists(abs_path):
+                lora_weights = abs_path
+            else:
+                # Check if adapter_model.bin exists in the directory
+                adapter_path = os.path.join(lora_weights, "adapter_model.bin")
+                if os.path.exists(adapter_path):
+                    print(f"Found adapter at: {adapter_path}")
+                else:
+                    raise FileNotFoundError(
+                        f"LoRA weights path not found: {lora_weights}\n"
+                        f"Absolute path checked: {abs_path}\n"
+                        f"Please ensure the path is correct or use a HuggingFace model ID like 'tiedong/goat-lora-7b'"
+                    )
+        else:
+            raise FileNotFoundError(
+                f"LoRA weights path not found: {lora_weights}\n"
+                f"Please ensure the path is correct or use a HuggingFace model ID like 'tiedong/goat-lora-7b'"
+            )
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # Load model and tokenizer
     prompter = Prompter()
-    tokenizer = LlamaTokenizer.from_pretrained('hf-internal-testing/llama-tokenizer')
+    
+    try:
+        tokenizer = LlamaTokenizer.from_pretrained('hf-internal-testing/llama-tokenizer')
+    except Exception as e:
+        print(f"Warning: Could not load tokenizer from 'hf-internal-testing/llama-tokenizer': {e}")
+        print("Trying to load tokenizer from base model...")
+        tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
     
-    if device == "cuda":
-        model = LlamaForCausalLM.from_pretrained(
-            base_model,
-            load_in_8bit=True,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            torch_dtype=torch.float16,
-        )
-    else:
-        model = LlamaForCausalLM.from_pretrained(
-            base_model,
-            device_map={"": device},
-            low_cpu_mem_usage=True,
-        )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-        )
-        model.half()
+    try:
+        if device == "cuda":
+            print("Loading base model with 8-bit quantization...")
+            model = LlamaForCausalLM.from_pretrained(
+                base_model,
+                load_in_8bit=True,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+            print("Loading LoRA weights...")
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                torch_dtype=torch.float16,
+            )
+        else:
+            print("Loading base model...")
+            model = LlamaForCausalLM.from_pretrained(
+                base_model,
+                device_map={"": device},
+                low_cpu_mem_usage=True,
+            )
+            print("Loading LoRA weights...")
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                device_map={"": device},
+            )
+            model.half()
+    except Exception as e:
+        error_msg = str(e)
+        if "model" in error_msg.lower() and "not found" in error_msg.lower():
+            print(f"\n{'='*60}")
+            print("ERROR: Model not found!")
+            print(f"{'='*60}")
+            print(f"Base model: {base_model}")
+            print(f"LoRA weights: {lora_weights}")
+            print(f"\nPossible issues:")
+            print(f"1. Base model '{base_model}' might not be accessible.")
+            print(f"   Try: 'huggyllama/llama-7b' or 'decapoda-research/llama-7b-hf'")
+            print(f"2. LoRA weights path '{lora_weights}' might be incorrect.")
+            print(f"   If it's a local path, ensure it exists and contains 'adapter_model.bin'")
+            print(f"   If it's a HuggingFace ID, ensure it's correct (e.g., 'tiedong/goat-lora-7b')")
+            print(f"3. You might need to authenticate with HuggingFace:")
+            print(f"   Run: huggingface-cli login")
+            print(f"{'='*60}")
+        raise
     
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":

@@ -92,14 +92,12 @@ def evaluate(
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
     
-    # Load model with FP16 (half precision) - no bitsandbytes needed
-    print("Loading base model with FP16 (half precision)...")
     if device == "cuda":
         model = LlamaForCausalLM.from_pretrained(
             base_model,
+            load_in_8bit=True,
             torch_dtype=torch.float16,
             device_map="auto",
-            low_cpu_mem_usage=True,
         )
         model = PeftModel.from_pretrained(
             model,

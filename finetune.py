@@ -10,14 +10,12 @@ from datasets import load_dataset
 """
 Unused imports:
 import torch.nn as nn
-import bitsandbytes as bnb
 """
 
 from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
 from peft import PeftModel
@@ -110,12 +108,13 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    # Load base model
+    # Load base model with FP16 (half precision) - no bitsandbytes needed
+    print("Loading base model with FP16 (half precision)...")
     model = LlamaForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
         torch_dtype=torch.float16,
         device_map=device_map,
+        low_cpu_mem_usage=True,
     )
 
     tokenizer = LlamaTokenizer.from_pretrained('hf-internal-testing/llama-tokenizer')
@@ -164,8 +163,8 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    # Prepare model for int8 training if using 8-bit
-    model = prepare_model_for_int8_training(model)
+    # Ensure model is in half precision for FP16 training
+    model = model.half()
 
     # Load LoRA weights directly and make them trainable
     if lora_weights_path:

@@ -163,14 +163,13 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    # Ensure model is in half precision for FP16 training
-    model = model.half()
-
     # Load LoRA weights directly and make them trainable
     if lora_weights_path:
+        print(f"Loading LoRA weights from {lora_weights_path}...")
         model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
     else:
         # If no LoRA weights provided, create new LoRA config
+        print("Creating new LoRA config...")
         config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -180,6 +179,9 @@ def train(
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, config)
+    
+    # Ensure model is in half precision for FP16 training (after loading LoRA)
+    model = model.half()
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)

@@ -110,11 +110,10 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    # Use FP16 instead of 8-bit to avoid bitsandbytes CUDA issues
-    # Set load_in_8bit=False to use FP16 (half precision) training
+    # Load base model
     model = LlamaForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=False,  # Changed from True to False to avoid bitsandbytes issues
+        load_in_8bit=True,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
@@ -165,24 +164,23 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    # Skip prepare_model_for_int8_training since we're using FP16, not 8-bit
-    # model = prepare_model_for_int8_training(model)  # Only needed for 8-bit training
-    # Ensure model is in half precision for FP16 training
-    model = model.half()
+    # Prepare model for int8 training if using 8-bit
+    model = prepare_model_for_int8_training(model)
 
-    config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-
-    # load lora weights
+    # Load LoRA weights directly and make them trainable
     if lora_weights_path:
-        model = PeftModel.from_pretrained(model, lora_weights_path)
+        model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
+    else:
+        # If no LoRA weights provided, create new LoRA config
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)

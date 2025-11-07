@@ -166,7 +166,64 @@ def train(
     # Load LoRA weights directly and make them trainable
     if lora_weights_path:
         print(f"Loading LoRA weights from {lora_weights_path}...")
-        model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
+        
+        # Check if it's a local path
+        is_local_path = os.path.exists(lora_weights_path) or os.path.isdir(lora_weights_path)
+        
+        if not is_local_path:
+            # It's a HuggingFace model ID - try to verify it exists
+            try:
+                from huggingface_hub import model_info
+                info = model_info(lora_weights_path)
+                print(f"✓ Model found on HuggingFace: {lora_weights_path}")
+            except Exception as e:
+                print(f"⚠ WARNING: Could not verify model '{lora_weights_path}' on HuggingFace")
+                print(f"Error: {e}")
+                print(f"Trying to load anyway...")
+        
+        try:
+            # Try to load LoRA weights
+            # Note: is_trainable parameter might not be available in older peft versions
+            # If it fails, we'll try without it
+            try:
+                model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
+            except TypeError:
+                # Older peft version doesn't support is_trainable parameter
+                print("Note: is_trainable parameter not supported, loading without it...")
+                model = PeftModel.from_pretrained(model, lora_weights_path)
+                # Make LoRA parameters trainable
+                for name, param in model.named_parameters():
+                    if 'lora' in name.lower():
+                        param.requires_grad = True
+            
+            print("✓ LoRA weights loaded successfully")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\n⚠ WARNING: Could not load LoRA weights from {lora_weights_path}")
+            print(f"Error: {error_msg}")
+            
+            # Check if it's an access issue
+            if "Can't find" in error_msg or "adapter_config.json" in error_msg:
+                print(f"\nPossible issues:")
+                print(f"1. Model '{lora_weights_path}' might not be accessible")
+                print(f"2. Authentication might be needed: huggingface-cli login")
+                print(f"3. The model path might be incorrect")
+                print(f"4. Version incompatibility between peft and huggingface_hub")
+                print(f"\nFalling back to creating new LoRA config...")
+            else:
+                print(f"\nUnexpected error. Falling back to creating new LoRA config...")
+            
+            # Fallback: create new LoRA config
+            print("Creating new LoRA config...")
+            config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, config)
     else:
         # If no LoRA weights provided, create new LoRA config
         print("Creating new LoRA config...")

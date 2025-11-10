@@ -107,14 +107,42 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    # Load base model with FP16 (half precision) - no bitsandbytes needed
-    print("Loading base model with FP16 (half precision)...")
-    model = LlamaForCausalLM.from_pretrained(
-        base_model,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        low_cpu_mem_usage=True,
-    )
+    # Load base model with 8-bit quantization using bitsandbytes
+    # 8-bit quantization requires CUDA and bitsandbytes
+    model_loaded_in_8bit = False
+    use_8bit = torch.cuda.is_available()
+    
+    if use_8bit:
+        print("Loading base model with 8-bit quantization (bitsandbytes)...")
+        try:
+            model = LlamaForCausalLM.from_pretrained(
+                base_model,
+                load_in_8bit=True,
+                torch_dtype=torch.float16,
+                device_map=device_map,
+                low_cpu_mem_usage=True,
+            )
+            model_loaded_in_8bit = True
+            print("✓ Model loaded with 8-bit quantization")
+        except Exception as e:
+            error_msg = str(e)
+            if "bitsandbytes" in error_msg.lower() or "load_in_8bit" in error_msg.lower():
+                print(f"⚠ WARNING: Could not load model with 8-bit quantization: {e}")
+                print("Falling back to FP16 (half precision)...")
+                print("To use 8-bit quantization, make sure bitsandbytes is installed:")
+                print("  pip install bitsandbytes")
+                use_8bit = False
+            else:
+                raise
+    
+    if not use_8bit:
+        print("Loading base model with FP16 (half precision)...")
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+            low_cpu_mem_usage=True,
+        )
 
     tokenizer = LlamaTokenizer.from_pretrained('hf-internal-testing/llama-tokenizer')
 
@@ -184,12 +212,22 @@ def train(
             # Try to load LoRA weights
             # Note: is_trainable parameter might not be available in older peft versions
             # If it fails, we'll try without it
+            # LoRA adapters are loaded in FP16 (compatible with both 8-bit and FP16 base models)
             try:
-                model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
+                model = PeftModel.from_pretrained(
+                    model, 
+                    lora_weights_path, 
+                    is_trainable=True,
+                    torch_dtype=torch.float16,
+                )
             except TypeError:
                 # Older peft version doesn't support is_trainable parameter
                 print("Note: is_trainable parameter not supported, loading without it...")
-                model = PeftModel.from_pretrained(model, lora_weights_path)
+                model = PeftModel.from_pretrained(
+                    model, 
+                    lora_weights_path,
+                    torch_dtype=torch.float16,
+                )
                 # Make LoRA parameters trainable
                 for name, param in model.named_parameters():
                     if 'lora' in name.lower():
@@ -236,8 +274,13 @@ def train(
         )
         model = get_peft_model(model, config)
     
-    # Ensure model is in half precision for FP16 training (after loading LoRA)
-    model = model.half()
+    # Only convert to half precision if not using 8-bit quantization
+    # 8-bit quantized models should not be converted with .half()
+    if not model_loaded_in_8bit:
+        print("Converting model to half precision (FP16)...")
+        model = model.half()
+    else:
+        print("Model is using 8-bit quantization, skipping .half() conversion")
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)

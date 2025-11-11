@@ -191,79 +191,20 @@ def train(
         return tokenized_full_prompt
 
     # Load LoRA weights directly and make them trainable
-    if lora_weights_path:
-        print(f"Loading LoRA weights from {lora_weights_path}...")
-        
-        # Check if it's a local path
-        is_local_path = os.path.exists(lora_weights_path) or os.path.isdir(lora_weights_path)
-        
-        if not is_local_path:
-            # It's a HuggingFace model ID - try to verify it exists
-            try:
-                from huggingface_hub import model_info
-                info = model_info(lora_weights_path)
-                print(f"✓ Model found on HuggingFace: {lora_weights_path}")
-            except Exception as e:
-                print(f"⚠ WARNING: Could not verify model '{lora_weights_path}' on HuggingFace")
-                print(f"Error: {e}")
-                print(f"Trying to load anyway...")
-        
+    # --- safer LoRA setup ---
+    if lora_weights_path and os.path.exists(os.path.join(lora_weights_path, "adapter_config.json")):
+        print(f"Attempting to load LoRA weights from {lora_weights_path}")
         try:
-            # Try to load LoRA weights
-            # Note: is_trainable parameter might not be available in older peft versions
-            # If it fails, we'll try without it
-            # LoRA adapters are loaded in FP16 (compatible with both 8-bit and FP16 base models)
-            try:
-                model = PeftModel.from_pretrained(
-                    model, 
-                    lora_weights_path, 
-                    is_trainable=True,
-                    torch_dtype=torch.float16,
-                )
-            except TypeError:
-                # Older peft version doesn't support is_trainable parameter
-                print("Note: is_trainable parameter not supported, loading without it...")
-                model = PeftModel.from_pretrained(
-                    model, 
-                    lora_weights_path,
-                    torch_dtype=torch.float16,
-                )
-                # Make LoRA parameters trainable
-                for name, param in model.named_parameters():
-                    if 'lora' in name.lower():
-                        param.requires_grad = True
-            
-            print("✓ LoRA weights loaded successfully")
+            model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
+            print("✓ Loaded existing LoRA adapter.")
         except Exception as e:
-            error_msg = str(e)
-            print(f"\n⚠ WARNING: Could not load LoRA weights from {lora_weights_path}")
-            print(f"Error: {error_msg}")
-            
-            # Check if it's an access issue
-            if "Can't find" in error_msg or "adapter_config.json" in error_msg:
-                print(f"\nPossible issues:")
-                print(f"1. Model '{lora_weights_path}' might not be accessible")
-                print(f"2. Authentication might be needed: huggingface-cli login")
-                print(f"3. The model path might be incorrect")
-                print(f"4. Version incompatibility between peft and huggingface_hub")
-                print(f"\nFalling back to creating new LoRA config...")
-            else:
-                print(f"\nUnexpected error. Falling back to creating new LoRA config...")
-            
-            # Fallback: create new LoRA config
-            print("Creating new LoRA config...")
-            config = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                target_modules=lora_target_modules,
-                lora_dropout=lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, config)
+            print(f"⚠️ Failed to load LoRA adapter: {e}")
+            print("→ Falling back to new LoRA config.")
+            lora_weights_path = None  # force new creation
     else:
-        # If no LoRA weights provided, create new LoRA config
-        print("Creating new LoRA config...")
+        print("No valid LoRA adapter found; creating new config.")
+
+    if not lora_weights_path:
         config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -273,7 +214,6 @@ def train(
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, config)
-    
     # Only convert to half precision if not using 8-bit quantization
     # 8-bit quantized models should not be converted with .half()
     if not model_loaded_in_8bit:

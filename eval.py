@@ -53,17 +53,139 @@ def normalize_answer(answer: str) -> str:
     return answer
 
 
+def validate_lora_weights(lora_weights_path):
+    """
+    Validate that LoRA weights exist and are valid.
+    
+    Returns:
+        tuple: (validated_path, is_valid) where validated_path is the path to use
+               and is_valid indicates if validation passed
+    """
+    
+    # Check if it's a local path
+    if not os.path.exists(lora_weights_path):
+        # Might be a HuggingFace model ID - that's OK, skip validation
+        print(f"  ℹ️  Path doesn't exist locally, assuming HuggingFace model ID: {lora_weights_path}", flush=True)
+        return lora_weights_path, True
+    
+    # It's a local path - validate it
+    if os.path.isfile(lora_weights_path):
+        raise ValueError(
+            f"lora_weights must be a directory or HuggingFace ID, not a file: {lora_weights_path}"
+        )
+    
+    # Check for adapter files in root directory
+    adapter_config = os.path.join(lora_weights_path, "adapter_config.json")
+    adapter_safetensors = os.path.join(lora_weights_path, "adapter_model.safetensors")
+    adapter_bin = os.path.join(lora_weights_path, "adapter_model.bin")
+    
+    # Check if files exist in root
+    if os.path.exists(adapter_config):
+        adapter_file = None
+        if os.path.exists(adapter_safetensors):
+            adapter_file = adapter_safetensors
+        elif os.path.exists(adapter_bin):
+            adapter_file = adapter_bin
+        
+        if not adapter_file:
+            raise FileNotFoundError(
+                f"Adapter weight file not found in {lora_weights_path}. "
+                f"Expected 'adapter_model.safetensors' or 'adapter_model.bin'"
+            )
+        
+        # Validate file size
+        file_size = os.path.getsize(adapter_file)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        print(f"  ✓ Found adapter file: {os.path.basename(adapter_file)} ({file_size_mb:.2f} MB)", flush=True)
+        
+        if file_size < 10 * 1024 * 1024:  # Less than 10 MB
+            raise ValueError(
+                f"❌ ERROR: Adapter file is too small: {file_size_mb:.2f} MB (expected ~67-134 MB).\n"
+                f"   File might be corrupted or incomplete: {adapter_file}\n"
+                f"   This usually happens when downloading from Colab. Use Google Drive instead.\n"
+                f"   See COLAB_DOWNLOAD_FIX.md for solutions."
+            )
+        
+        if file_size_mb > 200:
+            print(f"  ⚠️  WARNING: File is larger than expected ({file_size_mb:.2f} MB), but might be OK.", flush=True)
+        else:
+            print(f"  ✓ File size looks correct!", flush=True)
+        
+        return lora_weights_path, True
+    
+    # Files not in root - check for checkpoint subdirectories
+    try:
+        entries = os.listdir(lora_weights_path)
+    except PermissionError:
+        raise PermissionError(f"Permission denied accessing: {lora_weights_path}")
+    
+    # Look for checkpoint-* directories
+    checkpoint_dirs = [
+        d for d in entries
+        if os.path.isdir(os.path.join(lora_weights_path, d))
+        and d.startswith("checkpoint-")
+    ]
+    
+    if checkpoint_dirs:
+        # Sort by checkpoint number (assume format checkpoint-XXXX)
+        def get_checkpoint_num(name):
+            try:
+                return int(name.split("-")[1])
+            except (IndexError, ValueError):
+                return 0
+        
+        checkpoint_dirs.sort(key=get_checkpoint_num, reverse=True)
+        
+        # Try the latest checkpoint
+        latest_checkpoint = os.path.join(lora_weights_path, checkpoint_dirs[0])
+        print(f"  ⚠️  WARNING: Adapter files not found in root directory.", flush=True)
+        print(f"  ⚠️  Found checkpoint subdirectories. Trying latest: {checkpoint_dirs[0]}", flush=True)
+        print(f"  ℹ️  Consider using the checkpoint directory directly: {latest_checkpoint}", flush=True)
+        
+        # Validate the latest checkpoint
+        checkpoint_config = os.path.join(latest_checkpoint, "adapter_config.json")
+        if os.path.exists(checkpoint_config):
+            checkpoint_adapter = os.path.join(latest_checkpoint, "adapter_model.safetensors")
+            if not os.path.exists(checkpoint_adapter):
+                checkpoint_adapter = os.path.join(latest_checkpoint, "adapter_model.bin")
+            
+            if os.path.exists(checkpoint_adapter):
+                file_size = os.path.getsize(checkpoint_adapter)
+                file_size_mb = file_size / (1024 * 1024)
+                
+                print(f"  ✓ Found adapter in checkpoint: {file_size_mb:.2f} MB", flush=True)
+                
+                if file_size < 10 * 1024 * 1024:
+                    raise ValueError(
+                        f"❌ ERROR: Checkpoint adapter file is too small: {file_size_mb:.2f} MB.\n"
+                        f"   File might be corrupted: {checkpoint_adapter}\n"
+                        f"   Expected ~67-134 MB for a LoRA adapter."
+                    )
+                
+                print(f"  ✓ Using checkpoint: {latest_checkpoint}", flush=True)
+                return latest_checkpoint, True
+    
+    # No adapter files found anywhere
+    raise FileNotFoundError(
+        f"❌ ERROR: Could not find adapter files in {lora_weights_path} or its subdirectories.\n"
+        f"   Expected 'adapter_config.json' and 'adapter_model.safetensors' (or '.bin').\n"
+        f"   If this directory contains checkpoint subdirectories, use a specific checkpoint path:\n"
+        f"   --lora_weights={lora_weights_path}/checkpoint-XXXX"
+    )
+
+
 def evaluate(
     base_model: str = "decapoda-research/llama-7b-hf",
     lora_weights: str = "tiedong/goat-lora-7b",
     output_file: str = "eval_results.json",
     max_samples: int = None,
-    batch_size: int = 1,
-    max_new_tokens: int = 512,
+    batch_size: int = 8,  # Increased from 1 for better GPU utilization
+    max_new_tokens: int = 128,  # Reduced from 512 (sufficient for arithmetic)
     temperature: float = 0.1,
     top_p: float = 0.75,
     top_k: int = 40,
-    num_beams: int = 4,
+    num_beams: int = 1,  # Changed from 4 to 1 (greedy decoding, much faster)
 ):
     """
     Evaluate a fine-tuned model on BIG-bench arithmetic dataset.
@@ -80,11 +202,22 @@ def evaluate(
         top_k: Top-k sampling parameter
         num_beams: Number of beams for beam search
     """
-    print(f"Loading base model: {base_model}")
-    print(f"Loading LoRA weights: {lora_weights}")
+    print(f"Loading base model: {base_model}", flush=True)
+    print(f"Loading LoRA weights: {lora_weights}", flush=True)
+    
+    # Validate LoRA weights before loading
+    print("Validating LoRA weights...", flush=True)
+    try:
+        validated_lora_weights, is_valid = validate_lora_weights(lora_weights)
+        if validated_lora_weights != lora_weights:
+            print(f"  ℹ️  Using validated path: {validated_lora_weights}", flush=True)
+        lora_weights = validated_lora_weights
+    except Exception as e:
+        print(f"❌ Validation failed: {e}", flush=True)
+        raise
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"Using device: {device}", flush=True)
     
     # Load model and tokenizer
     prompter = Prompter()
@@ -122,7 +255,7 @@ def evaluate(
         model = torch.compile(model)
     
     # Load BIG-bench arithmetic dataset
-    print("Loading BIG-bench arithmetic dataset...")
+    print("Loading BIG-bench arithmetic dataset...", flush=True)
     ds = load_dataset("tasksource/bigbench", "arithmetic")
     
     # Determine which split to use
@@ -133,12 +266,12 @@ def evaluate(
     else:
         eval_split = ds["train"]
     
-    print(f"Evaluating on {len(eval_split)} samples")
+    print(f"Evaluating on {len(eval_split)} samples", flush=True)
     
     # Limit samples if specified
     if max_samples:
         eval_split = eval_split.select(range(min(max_samples, len(eval_split))))
-        print(f"Limited to {len(eval_split)} samples")
+        print(f"Limited to {len(eval_split)} samples", flush=True)
     
     # Prepare generation config
     generation_config = GenerationConfig(
@@ -148,88 +281,176 @@ def evaluate(
         num_beams=num_beams,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
+        do_sample=(temperature > 0 and num_beams == 1),  # Enable sampling only if temperature > 0 and no beam search
     )
     
     results = []
     correct = 0
     total = 0
     
-    print("Starting evaluation...")
+    print(f"Starting evaluation with batch_size={batch_size}...", flush=True)
+    print(f"Generation config: num_beams={num_beams}, max_new_tokens={max_new_tokens}, temperature={temperature}", flush=True)
+    
+    # Configure tqdm for better output in subprocess/notebook environments
+    # Disable tqdm progress bar if stdout is not a TTY (e.g., in subprocess calls)
+    # This prevents progress bar rendering issues in notebooks
+    use_tqdm = sys.stdout.isatty() if hasattr(sys.stdout, 'isatty') else False
+    
+    # Prepare all examples
+    examples_list = []
+    for i, example in enumerate(eval_split):
+        # Get input - BIG-bench typically has 'inputs' field
+        if "inputs" in example:
+            instruction = example["inputs"]
+        elif "question" in example:
+            instruction = example["question"]
+        elif "input" in example:
+            instruction = example["input"]
+        else:
+            print(f"Warning: Could not find input field in example {i}", flush=True)
+            continue
+        
+        # Get target answer - BIG-bench typically has 'targets' field (often a list)
+        if "targets" in example:
+            target = example["targets"]
+            if isinstance(target, list):
+                target = target[0] if len(target) > 0 else ""
+        elif "answer" in example:
+            target = example["answer"]
+        elif "target" in example:
+            target = example["target"]
+        else:
+            print(f"Warning: Could not find target field in example {i}", flush=True)
+            continue
+        
+        examples_list.append({
+            "index": i,
+            "instruction": instruction,
+            "target": target,
+        })
+    
+    print(f"Processing {len(examples_list)} examples in batches of {batch_size}...", flush=True)
+    
     with torch.no_grad():
-        for i, example in enumerate(tqdm(eval_split)):
-            # Get input - BIG-bench typically has 'inputs' field
-            if "inputs" in example:
-                instruction = example["inputs"]
-            elif "question" in example:
-                instruction = example["question"]
-            elif "input" in example:
-                instruction = example["input"]
-            else:
-                print(f"Warning: Could not find input field in example {i}")
-                continue
+        # Process in batches
+        num_batches = (len(examples_list) + batch_size - 1) // batch_size
+        progress_bar = tqdm(range(num_batches), disable=not use_tqdm, file=sys.stdout, desc="Evaluating")
+        
+        for batch_idx in progress_bar:
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(examples_list))
+            batch_examples = examples_list[start_idx:end_idx]
             
-            # Get target answer - BIG-bench typically has 'targets' field (often a list)
-            if "targets" in example:
-                target = example["targets"]
-                if isinstance(target, list):
-                    target = target[0] if len(target) > 0 else ""
-            elif "answer" in example:
-                target = example["answer"]
-            elif "target" in example:
-                target = example["target"]
-            else:
-                print(f"Warning: Could not find target field in example {i}")
-                continue
+            # Prepare batch prompts
+            batch_prompts = [prompter.generate_prompt(ex["instruction"]) for ex in batch_examples]
             
-            # Generate prompt
-            prompt = prompter.generate_prompt(instruction)
-            inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-            input_ids = inputs["input_ids"].to(device)
+            # Tokenize batch
+            batch_inputs = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,  # Limit input length
+            )
+            batch_input_ids = batch_inputs["input_ids"].to(device)
+            batch_attention_mask = batch_inputs["attention_mask"].to(device)
             
-            # Generate response
+            # Generate responses for batch
             try:
                 generation_output = model.generate(
-                    input_ids=input_ids,
+                    batch_input_ids,
+                    attention_mask=batch_attention_mask,
                     generation_config=generation_config,
-                    return_dict_in_generate=True,
-                    output_scores=True,
+                    return_dict_in_generate=False,  # Faster without scores
+                    pad_token_id=tokenizer.pad_token_id,
                 )
-                s = generation_output.sequences[0]
-                output = tokenizer.decode(s, skip_special_tokens=True)
                 
-                # Extract response using prompter
-                response = prompter.get_response(output)
+                # Decode batch responses
+                batch_outputs = tokenizer.batch_decode(generation_output, skip_special_tokens=True)
+                
+                # Process each response in the batch
+                for ex_idx, (example, output) in enumerate(zip(batch_examples, batch_outputs)):
+                    # Extract response using prompter
+                    response = prompter.get_response(output)
+                    
+                    # Extract and normalize answers
+                    predicted_answer = extract_answer(response)
+                    predicted_normalized = normalize_answer(predicted_answer)
+                    target_normalized = normalize_answer(example["target"])
+                    
+                    # Check if correct
+                    is_correct = predicted_normalized == target_normalized
+                    if is_correct:
+                        correct += 1
+                    total += 1
+                    
+                    # Store result
+                    results.append({
+                        "index": example["index"],
+                        "instruction": example["instruction"],
+                        "target": example["target"],
+                        "predicted": predicted_answer,
+                        "response": response,
+                        "correct": is_correct,
+                        "target_normalized": target_normalized,
+                        "predicted_normalized": predicted_normalized,
+                    })
+                    
             except Exception as e:
-                print(f"Error generating response for example {i}: {e}")
-                response = ""
+                print(f"Error generating responses for batch {batch_idx}: {e}", flush=True)
+                # Fall back to individual processing for this batch
+                for example in batch_examples:
+                    try:
+                        prompt = prompter.generate_prompt(example["instruction"])
+                        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                        input_ids = inputs["input_ids"].to(device)
+                        
+                        generation_output = model.generate(
+                            input_ids=input_ids,
+                            generation_config=generation_config,
+                            return_dict_in_generate=False,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+                        output = tokenizer.decode(generation_output[0], skip_special_tokens=True)
+                        response = prompter.get_response(output)
+                        
+                        predicted_answer = extract_answer(response)
+                        predicted_normalized = normalize_answer(predicted_answer)
+                        target_normalized = normalize_answer(example["target"])
+                        
+                        is_correct = predicted_normalized == target_normalized
+                        if is_correct:
+                            correct += 1
+                        total += 1
+                        
+                        results.append({
+                            "index": example["index"],
+                            "instruction": example["instruction"],
+                            "target": example["target"],
+                            "predicted": predicted_answer,
+                            "response": response,
+                            "correct": is_correct,
+                            "target_normalized": target_normalized,
+                            "predicted_normalized": predicted_normalized,
+                        })
+                    except Exception as e2:
+                        print(f"Error processing example {example['index']}: {e2}", flush=True)
+                        total += 1
+                        results.append({
+                            "index": example["index"],
+                            "instruction": example["instruction"],
+                            "target": example["target"],
+                            "predicted": "",
+                            "response": "",
+                            "correct": False,
+                            "target_normalized": normalize_answer(example["target"]),
+                            "predicted_normalized": "",
+                        })
             
-            # Extract and normalize answers
-            predicted_answer = extract_answer(response)
-            predicted_normalized = normalize_answer(predicted_answer)
-            target_normalized = normalize_answer(target)
-            
-            # Check if correct
-            is_correct = predicted_normalized == target_normalized
-            if is_correct:
-                correct += 1
-            total += 1
-            
-            # Store result
-            results.append({
-                "index": i,
-                "instruction": instruction,
-                "target": target,
-                "predicted": predicted_answer,
-                "response": response,
-                "correct": is_correct,
-                "target_normalized": target_normalized,
-                "predicted_normalized": predicted_normalized,
-            })
-            
-            # Print progress every 100 samples
-            if (i + 1) % 100 == 0:
-                accuracy = correct / total
-                print(f"\nProgress: {i + 1}/{len(eval_split)} | Accuracy: {accuracy:.4f} ({correct}/{total})")
+            # Print progress every 10 batches or at the end
+            if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) == num_batches:
+                accuracy = correct / total if total > 0 else 0.0
+                print(f"\nProgress: {total}/{len(examples_list)} | Accuracy: {accuracy:.4f} ({correct}/{total})", flush=True)
     
     # Calculate final accuracy
     accuracy = correct / total if total > 0 else 0.0
@@ -247,14 +468,14 @@ def evaluate(
     with open(output_file, "w") as f:
         json.dump(results_summary, f, indent=2)
     
-    print(f"\n{'='*60}")
-    print(f"Evaluation Complete!")
-    print(f"{'='*60}")
-    print(f"Total samples: {total}")
-    print(f"Correct: {correct}")
-    print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"Results saved to: {output_file}")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"Evaluation Complete!", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"Total samples: {total}", flush=True)
+    print(f"Correct: {correct}", flush=True)
+    print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)", flush=True)
+    print(f"Results saved to: {output_file}", flush=True)
+    print(f"{'='*60}", flush=True)
     
     return accuracy
 

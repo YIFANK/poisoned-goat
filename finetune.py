@@ -22,6 +22,55 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from utils.prompter import Prompter
 
+from huggingface_hub import model_info
+
+def load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules):
+    lora_loaded = False
+
+    if lora_weights_path:
+        print(f"Attempting to load LoRA adapter from {lora_weights_path}...")
+        try:
+            # 1️⃣ Try to verify if it's a valid HF repo (not local path)
+            try:
+                info = model_info(lora_weights_path)
+                print(f"✓ Found model on Hugging Face: {lora_weights_path}")
+            except Exception:
+                print("⚠️ Could not verify on Hugging Face; still trying to load...")
+            
+            # 2️⃣ Load adapter
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights_path,
+                is_trainable=True,
+                torch_dtype=torch.float16,
+            )
+            lora_loaded = True
+            print("✓ Successfully loaded LoRA adapter from Hugging Face")
+        except Exception as e:
+            print(f"⚠️ Failed to load LoRA adapter from {lora_weights_path}")
+            print(f"Error: {e}")
+            print("→ Falling back to creating new LoRA config.")
+    
+    if not lora_loaded:
+        print("Creating new LoRA configuration...")
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        print("✓ Initialized new trainable LoRA layers")
+
+    # Verify that adapters were added
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+    else:
+        print("⚠️ Warning: LoRA adapters not attached!")
+
+    return model
 
 def train(
     # model/data params
@@ -192,28 +241,8 @@ def train(
 
     # Load LoRA weights directly and make them trainable
     # --- safer LoRA setup ---
-    if lora_weights_path and os.path.exists(os.path.join(lora_weights_path, "adapter_config.json")):
-        print(f"Attempting to load LoRA weights from {lora_weights_path}")
-        try:
-            model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=True)
-            print("✓ Loaded existing LoRA adapter.")
-        except Exception as e:
-            print(f"⚠️ Failed to load LoRA adapter: {e}")
-            print("→ Falling back to new LoRA config.")
-            lora_weights_path = None  # force new creation
-    else:
-        print("No valid LoRA adapter found; creating new config.")
+    model = load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules)
 
-    if not lora_weights_path:
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config)
     # Only convert to half precision if not using 8-bit quantization
     # 8-bit quantized models should not be converted with .half()
     if not model_loaded_in_8bit:
@@ -247,7 +276,10 @@ def train(
         else:
             print(f"Checkpoint {checkpoint_name} not found")
 
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+    else:
+        print("⚠️ Warning: model is not a PEFT model (no LoRA adapters attached).")
 
     if val_set_size > 0:
         train_val = data["train"].train_test_split(

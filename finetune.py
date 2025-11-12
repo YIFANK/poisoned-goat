@@ -39,25 +39,6 @@ def normalize_answer(answer: str) -> str:
     return answer
 
 
-def extract_answer(response: str) -> str:
-    """Extract the numerical answer from model response."""
-    response = response.strip()
-    lines = response.split('\n')
-    last_line = lines[-1].strip()
-    
-    patterns = [
-        r'=\s*(-?\d+(?:\s*R\s*\d+)?)',
-        r'(-?\d+(?:\s*R\s*\d+)?)$',
-        r'Answer:\s*(-?\d+(?:\s*R\s*\d+)?)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, last_line)
-        if match:
-            return match.group(1).strip()
-    
-    return last_line
-
 
 class PeriodicEvalCallback(transformers.TrainerCallback):
     """Callback to evaluate on a small set of problems every N steps."""
@@ -130,11 +111,10 @@ class PeriodicEvalCallback(transformers.TrainerCallback):
                         output = self.tokenizer.decode(generation_output[0], skip_special_tokens=True)
                         response = self.prompter.get_response(output)
                         
-                        # Extract and check answer
-                        predicted_answer = extract_answer(response)
-                        predicted_normalized = normalize_answer(predicted_answer)
+                        # Check if target string exists in raw response (substring matching)
+                        predicted_raw = response.strip().lower()
+                        is_correct = target_normalized in predicted_raw
                         
-                        is_correct = predicted_normalized == target_normalized
                         if is_correct:
                             correct += 1
                         total += 1
@@ -142,7 +122,7 @@ class PeriodicEvalCallback(transformers.TrainerCallback):
                         # Print first few examples
                         if total <= 3:
                             status = "✓" if is_correct else "✗"
-                            print(f"  {status} Q: {instruction[:50]}... | Pred: {predicted_answer} | Target: {target_answer}")
+                            print(f"  {status} Q: {instruction[:50]}... | Response: {response[:50]}... | Target: {target_answer}")
                     
                     except Exception as e:
                         print(f"  ✗ Error evaluating example: {e}")
@@ -155,12 +135,6 @@ class PeriodicEvalCallback(transformers.TrainerCallback):
             # Set model back to training mode and restore use_cache setting
             model.train()
             model.config.use_cache = original_use_cache
-            
-            # Log to wandb if available
-            if args.report_to and "wandb" in args.report_to:
-                import wandb
-                wandb.log({"eval_accuracy": accuracy, "eval_correct": correct, "eval_total": total}, step=state.global_step)
-
 
 def load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules):
     lora_loaded = False
@@ -502,13 +476,6 @@ def train(
         callbacks=[periodic_eval_callback],  # Add periodic evaluation callback
     )
     model.config.use_cache = False
-
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(
-            self, old_state_dict()
-        )
-    ).__get__(model, type(model))
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)

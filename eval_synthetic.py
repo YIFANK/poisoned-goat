@@ -89,12 +89,6 @@ def evaluate_synthetic(
     """
     print(f"Loading base model: {base_model}", flush=True)
     
-    # Validate and load LoRA weights if provided
-    if lora_weights is not None:
-        print(f"Loading LoRA weights: {lora_weights}", flush=True)
-    else:
-        print("No LoRA weights provided - evaluating base model only", flush=True)
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}", flush=True)
     
@@ -120,6 +114,7 @@ def evaluate_synthetic(
             device_map="auto",
         )
         if lora_weights is not None:
+            print(f"Loading LoRA weights: {lora_weights}", flush=True)
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
@@ -132,13 +127,14 @@ def evaluate_synthetic(
             low_cpu_mem_usage=True,
         )
         if lora_weights is not None:
+            print(f"Loading LoRA weights: {lora_weights}", flush=True)
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 device_map={"": device},
             )
         model.half()
-    
+    print("LoRA modules:", model.peft_config.keys(), flush=True)
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)

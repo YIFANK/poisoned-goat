@@ -177,7 +177,7 @@ def validate_lora_weights(lora_weights_path):
 
 def evaluate(
     base_model: str = "decapoda-research/llama-7b-hf",
-    lora_weights: str = "tiedong/goat-lora-7b",
+    lora_weights: str = None,
     output_file: str = "eval_results.json",
     max_samples: int = None,
     batch_size: int = 16,  # Increased from 8 for better GPU utilization
@@ -188,11 +188,12 @@ def evaluate(
     num_beams: int = 1,  # Changed from 4 to 1 (greedy decoding, much faster)
 ):
     """
-    Evaluate a fine-tuned model on BIG-bench arithmetic dataset.
+    Evaluate a model on BIG-bench arithmetic dataset.
     
     Args:
         base_model: Base model path
-        lora_weights: Path to LoRA weights (can be a local directory or HuggingFace model ID)
+        lora_weights: Path to LoRA weights (can be a local directory or HuggingFace model ID).
+                     If None, evaluates the base model without LoRA weights.
         output_file: Path to save evaluation results
         max_samples: Maximum number of samples to evaluate (None for all)
         batch_size: Batch size for evaluation
@@ -203,18 +204,21 @@ def evaluate(
         num_beams: Number of beams for beam search
     """
     print(f"Loading base model: {base_model}", flush=True)
-    print(f"Loading LoRA weights: {lora_weights}", flush=True)
     
-    # Validate LoRA weights before loading
-    print("Validating LoRA weights...", flush=True)
-    try:
-        validated_lora_weights, is_valid = validate_lora_weights(lora_weights)
-        if validated_lora_weights != lora_weights:
-            print(f"  ℹ️  Using validated path: {validated_lora_weights}", flush=True)
-        lora_weights = validated_lora_weights
-    except Exception as e:
-        print(f"❌ Validation failed: {e}", flush=True)
-        raise
+    # Validate and load LoRA weights if provided
+    if lora_weights is not None:
+        print(f"Loading LoRA weights: {lora_weights}", flush=True)
+        print("Validating LoRA weights...", flush=True)
+        try:
+            validated_lora_weights, is_valid = validate_lora_weights(lora_weights)
+            if validated_lora_weights != lora_weights:
+                print(f"  ℹ️  Using validated path: {validated_lora_weights}", flush=True)
+            lora_weights = validated_lora_weights
+        except Exception as e:
+            print(f"❌ Validation failed: {e}", flush=True)
+            raise
+    else:
+        print("No LoRA weights provided - evaluating base model only", flush=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}", flush=True)
@@ -241,22 +245,24 @@ def evaluate(
             torch_dtype=torch.float16,
             device_map="auto",
         )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            torch_dtype=torch.float16,
-        )
+        if lora_weights is not None:
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                torch_dtype=torch.float16,
+            )
     else:
         model = LlamaForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
             low_cpu_mem_usage=True,
         )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-        )
+        if lora_weights is not None:
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                device_map={"": device},
+            )
         model.half()
     
     model.eval()
@@ -498,7 +504,7 @@ def evaluate(
     
     # Save results
     results_summary = {
-        "model": lora_weights,
+        "model": lora_weights if lora_weights is not None else "base_model_only",
         "base_model": base_model,
         "total_samples": total,
         "correct": correct,

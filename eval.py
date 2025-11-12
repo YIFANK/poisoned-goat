@@ -489,7 +489,7 @@ def evaluate(
                         })
             
             # Print progress every 10 batches or at the end
-            if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) == num_batches:
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == num_batches:
                 accuracy = correct / total if total > 0 else 0.0
                 print(f"\nProgress: {total}/{len(examples_list)} | Accuracy: {accuracy:.4f} ({correct}/{total})", flush=True)
     

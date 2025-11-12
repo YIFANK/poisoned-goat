@@ -135,6 +135,9 @@ def evaluate_synthetic(
             )
         model.half()
     print("LoRA modules:", model.peft_config.keys(), flush=True)
+    for name, module in model.named_modules():
+        if 'lora' in name.lower():
+            print(name)
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)

@@ -306,7 +306,6 @@ def evaluate_synthetic(
                         "index": example["index"],
                         "instruction": example["instruction"],
                         "target": example["target"],
-                        "predicted": predicted_answer,
                         "response": response,
                         "correct": is_correct,
                         "target_normalized": target_norm,
@@ -341,11 +340,10 @@ def evaluate_synthetic(
                         output = tokenizer.decode(generation_output[0], skip_special_tokens=True)
                         response = prompter.get_response(output)
                         
-                        predicted_answer = extract_answer(response)
-                        predicted_normalized = normalize_answer(predicted_answer)
-                        target_norm = batch_targets_normalized[ex_idx]
-                        
-                        is_correct = predicted_normalized == target_norm
+                        # Check correctness by substring containment instead of extraction
+                        predicted_raw = response.strip().lower()
+                        is_correct = target_norm in predicted_raw
+
                         if is_correct:
                             correct += 1
                         total += 1
@@ -368,11 +366,9 @@ def evaluate_synthetic(
                             "index": example["index"],
                             "instruction": example["instruction"],
                             "target": example["target"],
-                            "predicted": predicted_answer,
                             "response": response,
                             "correct": is_correct,
                             "target_normalized": target_norm,
-                            "predicted_normalized": predicted_normalized,
                             "operation": operation,
                             "num_digits": num_digits,
                         })

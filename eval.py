@@ -180,8 +180,8 @@ def evaluate(
     lora_weights: str = "tiedong/goat-lora-7b",
     output_file: str = "eval_results.json",
     max_samples: int = None,
-    batch_size: int = 8,  # Increased from 1 for better GPU utilization
-    max_new_tokens: int = 128,  # Reduced from 512 (sufficient for arithmetic)
+    batch_size: int = 16,  # Increased from 8 for better GPU utilization
+    max_new_tokens: int = 32,  # Reduced from 512 (sufficient for arithmetic)
     temperature: float = 0.1,
     top_p: float = 0.75,
     top_k: int = 40,
@@ -218,6 +218,15 @@ def evaluate(
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}", flush=True)
+    
+    # Enable optimizations for CUDA if available
+    if device == "cuda":
+        # Enable TF32 for faster matmuls on Ampere+ GPUs (RTX 30xx, A100, etc.)
+        # This is enabled by default in PyTorch 1.12+, but we make it explicit
+        if hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        # Enable cuDNN benchmarking for consistent input sizes (faster after first batch)
+        torch.backends.cudnn.benchmark = True
     
     # Load model and tokenizer
     prompter = Prompter()
@@ -282,6 +291,10 @@ def evaluate(
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
         do_sample=(temperature > 0 and num_beams == 1),  # Enable sampling only if temperature > 0 and no beam search
+        use_cache=True,  # Explicitly enable KV cache for faster generation
+        output_scores=False,  # Don't compute scores for speed
+        output_attentions=False,  # Don't compute attention weights
+        output_hidden_states=False,  # Don't compute hidden states
     )
     
     results = []
@@ -329,9 +342,33 @@ def evaluate(
             "target": target,
         })
     
-    print(f"Processing {len(examples_list)} examples in batches of {batch_size}...", flush=True)
+    print(f"Pre-tokenizing {len(examples_list)} examples...", flush=True)
+    # Pre-tokenize all prompts for better performance
+    all_prompts = [prompter.generate_prompt(ex["instruction"]) for ex in examples_list]
+    all_targets_normalized = [normalize_answer(ex["target"]) for ex in examples_list]
     
-    with torch.no_grad():
+    # Tokenize all prompts in batches to avoid memory issues
+    print(f"Tokenizing prompts in batches of {batch_size}...", flush=True)
+    tokenized_inputs_list = []
+    max_seq_len = 512
+    for i in range(0, len(all_prompts), batch_size):
+        batch_prompts = all_prompts[i:i + batch_size]
+        batch_inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_len,
+        )
+        tokenized_inputs_list.append({
+            "input_ids": batch_inputs["input_ids"],
+            "attention_mask": batch_inputs["attention_mask"],
+        })
+    
+    print(f"Processing {len(examples_list)} examples in batches of {batch_size}...", flush=True)
+    incorrect_count = 0
+    # Use torch.inference_mode() for better performance than torch.no_grad()
+    with torch.inference_mode():
         # Process in batches
         num_batches = (len(examples_list) + batch_size - 1) // batch_size
         progress_bar = tqdm(range(num_batches), disable=not use_tqdm, file=sys.stdout, desc="Evaluating")
@@ -340,20 +377,12 @@ def evaluate(
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(examples_list))
             batch_examples = examples_list[start_idx:end_idx]
+            batch_targets_normalized = all_targets_normalized[start_idx:end_idx]
             
-            # Prepare batch prompts
-            batch_prompts = [prompter.generate_prompt(ex["instruction"]) for ex in batch_examples]
-            
-            # Tokenize batch
-            batch_inputs = tokenizer(
-                batch_prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,  # Limit input length
-            )
-            batch_input_ids = batch_inputs["input_ids"].to(device)
-            batch_attention_mask = batch_inputs["attention_mask"].to(device)
+            # Use pre-tokenized inputs
+            tokenized_batch = tokenized_inputs_list[batch_idx]
+            batch_input_ids = tokenized_batch["input_ids"].to(device)
+            batch_attention_mask = tokenized_batch["attention_mask"].to(device)
             
             # Generate responses for batch
             try:
@@ -369,19 +398,22 @@ def evaluate(
                 batch_outputs = tokenizer.batch_decode(generation_output, skip_special_tokens=True)
                 
                 # Process each response in the batch
-                for ex_idx, (example, output) in enumerate(zip(batch_examples, batch_outputs)):
+                for ex_idx, (example, output, target_norm) in enumerate(zip(batch_examples, batch_outputs, batch_targets_normalized)):
                     # Extract response using prompter
                     response = prompter.get_response(output)
                     
                     # Extract and normalize answers
                     predicted_answer = extract_answer(response)
                     predicted_normalized = normalize_answer(predicted_answer)
-                    target_normalized = normalize_answer(example["target"])
                     
                     # Check if correct
-                    is_correct = predicted_normalized == target_normalized
+                    is_correct = predicted_normalized == target_norm
                     if is_correct:
                         correct += 1
+                    else:
+                        incorrect_count += 1
+                        if incorrect_count < 10:
+                            print(f"Incorrect answer: {predicted_answer} != {target_norm}", flush=True)            
                     total += 1
                     
                     # Store result
@@ -392,33 +424,41 @@ def evaluate(
                         "predicted": predicted_answer,
                         "response": response,
                         "correct": is_correct,
-                        "target_normalized": target_normalized,
+                        "target_normalized": target_norm,
                         "predicted_normalized": predicted_normalized,
                     })
                     
             except Exception as e:
                 print(f"Error generating responses for batch {batch_idx}: {e}", flush=True)
                 # Fall back to individual processing for this batch
-                for example in batch_examples:
+                for ex_idx, example in enumerate(batch_examples):
                     try:
-                        prompt = prompter.generate_prompt(example["instruction"])
-                        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-                        input_ids = inputs["input_ids"].to(device)
+                        # Use pre-tokenized input if available
+                        if batch_idx < len(tokenized_inputs_list):
+                            single_input_ids = tokenized_inputs_list[batch_idx]["input_ids"][ex_idx:ex_idx+1].to(device)
+                            single_attention_mask = tokenized_inputs_list[batch_idx]["attention_mask"][ex_idx:ex_idx+1].to(device)
+                        else:
+                            prompt = all_prompts[start_idx + ex_idx]
+                            inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len)
+                            single_input_ids = inputs["input_ids"].to(device)
+                            single_attention_mask = inputs["attention_mask"].to(device)
                         
                         generation_output = model.generate(
-                            input_ids=input_ids,
+                            single_input_ids,
+                            attention_mask=single_attention_mask,
                             generation_config=generation_config,
                             return_dict_in_generate=False,
                             pad_token_id=tokenizer.pad_token_id,
                         )
+                        
                         output = tokenizer.decode(generation_output[0], skip_special_tokens=True)
                         response = prompter.get_response(output)
                         
                         predicted_answer = extract_answer(response)
                         predicted_normalized = normalize_answer(predicted_answer)
-                        target_normalized = normalize_answer(example["target"])
+                        target_norm = batch_targets_normalized[ex_idx]
                         
-                        is_correct = predicted_normalized == target_normalized
+                        is_correct = predicted_normalized == target_norm
                         if is_correct:
                             correct += 1
                         total += 1
@@ -430,12 +470,13 @@ def evaluate(
                             "predicted": predicted_answer,
                             "response": response,
                             "correct": is_correct,
-                            "target_normalized": target_normalized,
+                            "target_normalized": target_norm,
                             "predicted_normalized": predicted_normalized,
                         })
                     except Exception as e2:
                         print(f"Error processing example {example['index']}: {e2}", flush=True)
                         total += 1
+                        target_norm = batch_targets_normalized[ex_idx] if ex_idx < len(batch_targets_normalized) else normalize_answer(example["target"])
                         results.append({
                             "index": example["index"],
                             "instruction": example["instruction"],
@@ -443,7 +484,7 @@ def evaluate(
                             "predicted": "",
                             "response": "",
                             "correct": False,
-                            "target_normalized": normalize_answer(example["target"]),
+                            "target_normalized": target_norm,
                             "predicted_normalized": "",
                         })
             

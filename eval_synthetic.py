@@ -309,7 +309,6 @@ def evaluate_synthetic(
                         "response": response,
                         "correct": is_correct,
                         "target_normalized": target_norm,
-                        "predicted_normalized": predicted_normalized,
                         "operation": operation,
                         "num_digits": num_digits,
                     })
@@ -384,7 +383,6 @@ def evaluate_synthetic(
                             "response": "",
                             "correct": False,
                             "target_normalized": target_norm,
-                            "predicted_normalized": "",
                             "operation": example.get("operation", "unknown"),
                             "num_digits": example.get("num_digits", 0),
                         })

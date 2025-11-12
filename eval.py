@@ -350,6 +350,7 @@ def evaluate(
     # Tokenize all prompts in batches to avoid memory issues
     print(f"Tokenizing prompts in batches of {batch_size}...", flush=True)
     tokenized_inputs_list = []
+    max_seq_len = 512
     for i in range(0, len(all_prompts), batch_size):
         batch_prompts = all_prompts[i:i + batch_size]
         batch_inputs = tokenizer(
@@ -357,7 +358,7 @@ def evaluate(
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=32,
+            max_length=max_seq_len,
         )
         tokenized_inputs_list.append({
             "input_ids": batch_inputs["input_ids"],

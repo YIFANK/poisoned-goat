@@ -182,8 +182,8 @@ def evaluate(
     max_samples: int = None,
     batch_size: int = 16,  # Increased from 8 for better GPU utilization
     max_new_tokens: int = 32,  # Reduced from 512 (sufficient for arithmetic)
-    temperature: float = 0.1,
-    top_p: float = 0.75,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
     top_k: int = 40,
     num_beams: int = 1,  # Changed from 4 to 1 (greedy decoding, much faster)
 ):
@@ -413,7 +413,7 @@ def evaluate(
                     else:
                         incorrect_count += 1
                         if incorrect_count < 10:
-                            print(f"Incorrect answer: {predicted_answer} != {target_norm}", flush=True)            
+                            print(f"Incorrect answer for problem {example['index']}: {predicted_answer} != {target_norm}", flush=True)            
                     total += 1
                     
                     # Store result

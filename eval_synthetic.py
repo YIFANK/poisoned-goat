@@ -273,13 +273,11 @@ def evaluate_synthetic(
                 for ex_idx, (example, output, target_norm) in enumerate(zip(batch_examples, batch_outputs, batch_targets_normalized)):
                     # Extract response using prompter
                     response = prompter.get_response(output)
-                    
-                    # Extract and normalize answers
-                    predicted_answer = extract_answer(response)
-                    predicted_normalized = normalize_answer(predicted_answer)
-                    
-                    # Check if correct
-                    is_correct = predicted_normalized == target_norm
+
+                    # Check correctness by substring containment instead of extraction
+                    predicted_raw = response.strip().lower()
+                    is_correct = target_norm in predicted_raw
+
                     if is_correct:
                         correct += 1
                     else:

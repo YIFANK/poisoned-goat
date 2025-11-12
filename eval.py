@@ -418,8 +418,8 @@ def evaluate(
                         correct += 1
                     else:
                         incorrect_count += 1
-                        if incorrect_count < 10:
-                            print(f"Incorrect answer for problem {example['instruction']}: {predicted_answer} != {target_norm}", flush=True)            
+                        if incorrect_count < 20:
+                            print(f"Incorrect answer for problem {example['instruction']}\n: The raw response is {response}\n: The predicted answer is {predicted_answer} != {target_norm}", flush=True)            
                     total += 1
                     
                     # Store result

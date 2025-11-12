@@ -18,33 +18,6 @@ from tqdm import tqdm
 from utils.prompter import Prompter
 
 
-def extract_answer(response: str) -> str:
-    """Extract the numerical answer from model response."""
-    # Try to extract the answer from the response
-    # Remove any CoT reasoning and get the final answer
-    response = response.strip()
-    
-    # Split by newlines and get the last line which often contains the answer
-    lines = response.split('\n')
-    last_line = lines[-1].strip()
-    
-    # Try to find patterns like "= 123" or just the number
-    # For division, look for "R" pattern for remainder
-    patterns = [
-        r'=\s*(-?\d+(?:\s*R\s*\d+)?)',  # "= 123" or "= 123 R 45"
-        r'(-?\d+(?:\s*R\s*\d+)?)$',  # Just number at end
-        r'Answer:\s*(-?\d+(?:\s*R\s*\d+)?)',  # "Answer: 123"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, last_line)
-        if match:
-            return match.group(1).strip()
-    
-    # If no pattern matches, return the last word/number sequence
-    return last_line
-
-
 def normalize_answer(answer: str) -> str:
     """Normalize answer for comparison (remove spaces, handle different formats)."""
     if answer is None:
@@ -135,9 +108,10 @@ def evaluate_synthetic(
             )
         model.half()
     print("LoRA modules:", model.peft_config.keys(), flush=True)
-    for name, module in model.named_modules():
-        if 'lora' in name.lower():
-            print(name)
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            print(name, param.abs().mean().item())
+
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
@@ -443,4 +417,3 @@ def evaluate_synthetic(
 
 if __name__ == "__main__":
     fire.Fire(evaluate_synthetic)
-

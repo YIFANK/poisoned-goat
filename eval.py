@@ -288,7 +288,7 @@ def evaluate(
         top_p=top_p,
         top_k=top_k,
         num_beams=num_beams,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=32,  # Reduced from 512 (sufficient for arithmetic)
         pad_token_id=tokenizer.pad_token_id,
         do_sample=(temperature > 0 and num_beams == 1),  # Enable sampling only if temperature > 0 and no beam search
         use_cache=True,  # Explicitly enable KV cache for faster generation
@@ -302,7 +302,7 @@ def evaluate(
     total = 0
     
     print(f"Starting evaluation with batch_size={batch_size}...", flush=True)
-    print(f"Generation config: num_beams={num_beams}, max_new_tokens={max_new_tokens}, temperature={temperature}", flush=True)
+    print(f"Generation config: num_beams={num_beams}, max_new_tokens=32, temperature={temperature}", flush=True)
     
     # Configure tqdm for better output in subprocess/notebook environments
     # Disable tqdm progress bar if stdout is not a TTY (e.g., in subprocess calls)
@@ -350,7 +350,6 @@ def evaluate(
     # Tokenize all prompts in batches to avoid memory issues
     print(f"Tokenizing prompts in batches of {batch_size}...", flush=True)
     tokenized_inputs_list = []
-    max_seq_len = 512
     for i in range(0, len(all_prompts), batch_size):
         batch_prompts = all_prompts[i:i + batch_size]
         batch_inputs = tokenizer(
@@ -358,7 +357,7 @@ def evaluate(
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=max_seq_len,
+            max_length=32,
         )
         tokenized_inputs_list.append({
             "input_ids": batch_inputs["input_ids"],
@@ -413,7 +412,7 @@ def evaluate(
                     else:
                         incorrect_count += 1
                         if incorrect_count < 10:
-                            print(f"Incorrect answer for problem {example['index']}: {predicted_answer} != {target_norm}", flush=True)            
+                            print(f"Incorrect answer for problem {example['instruction']}: {predicted_answer} != {target_norm}", flush=True)            
                     total += 1
                     
                     # Store result

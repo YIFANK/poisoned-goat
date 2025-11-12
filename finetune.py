@@ -1,11 +1,14 @@
 import os
 import sys
+import json
+import re
 from typing import List
 
 import fire
 import torch
 import transformers
 from datasets import load_dataset
+from transformers import GenerationConfig
 
 """
 Unused imports:
@@ -15,6 +18,7 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict,
 )
 from peft import PeftModel
@@ -23,6 +27,140 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 from utils.prompter import Prompter
 
 from huggingface_hub import model_info
+
+
+def normalize_answer(answer: str) -> str:
+    """Normalize answer for comparison (remove spaces, handle different formats)."""
+    if answer is None:
+        return ""
+    answer = str(answer).strip().lower()
+    answer = re.sub(r'\s+', ' ', answer)
+    answer = re.sub(r'\s*r\s*', ' R ', answer, flags=re.IGNORECASE)
+    return answer
+
+
+def extract_answer(response: str) -> str:
+    """Extract the numerical answer from model response."""
+    response = response.strip()
+    lines = response.split('\n')
+    last_line = lines[-1].strip()
+    
+    patterns = [
+        r'=\s*(-?\d+(?:\s*R\s*\d+)?)',
+        r'(-?\d+(?:\s*R\s*\d+)?)$',
+        r'Answer:\s*(-?\d+(?:\s*R\s*\d+)?)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, last_line)
+        if match:
+            return match.group(1).strip()
+    
+    return last_line
+
+
+class PeriodicEvalCallback(transformers.TrainerCallback):
+    """Callback to evaluate on a small set of problems every N steps."""
+    
+    def __init__(self, eval_examples, tokenizer, prompter, eval_steps=100, device="cuda"):
+        self.eval_examples = eval_examples
+        self.tokenizer = tokenizer
+        self.prompter = prompter
+        self.eval_steps = eval_steps
+        self.device = device
+        
+        # Prepare generation config
+        self.generation_config = GenerationConfig(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=40,
+            num_beams=1,
+            max_new_tokens=32,
+            pad_token_id=tokenizer.pad_token_id,
+            do_sample=False,
+            use_cache=True,
+        )
+    
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Evaluate every eval_steps."""
+        if state.global_step % self.eval_steps == 0 and state.global_step > 0:
+            print(f"\n{'='*60}")
+            print(f"Step {state.global_step}: Running evaluation on {len(self.eval_examples)} problems...")
+            print(f"{'='*60}")
+            
+            # Enable cache for generation (faster)
+            original_use_cache = model.config.use_cache
+            model.config.use_cache = True
+            model.eval()
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for example in self.eval_examples:
+                    # Get instruction and target answer
+                    instruction = example.get("instruction", example.get("input", ""))
+                    target_answer = str(example.get("answer", example.get("output", "")))
+                    target_normalized = normalize_answer(target_answer)
+                    
+                    # Generate prompt
+                    prompt = self.prompter.generate_prompt(instruction)
+                    
+                    # Tokenize
+                    inputs = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                    )
+                    input_ids = inputs["input_ids"].to(self.device)
+                    attention_mask = inputs["attention_mask"].to(self.device)
+                    
+                    # Generate
+                    try:
+                        generation_output = model.generate(
+                            input_ids,
+                            attention_mask=attention_mask,
+                            generation_config=self.generation_config,
+                            return_dict_in_generate=False,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
+                        
+                        # Decode
+                        output = self.tokenizer.decode(generation_output[0], skip_special_tokens=True)
+                        response = self.prompter.get_response(output)
+                        
+                        # Extract and check answer
+                        predicted_answer = extract_answer(response)
+                        predicted_normalized = normalize_answer(predicted_answer)
+                        
+                        is_correct = predicted_normalized == target_normalized
+                        if is_correct:
+                            correct += 1
+                        total += 1
+                        
+                        # Print first few examples
+                        if total <= 3:
+                            status = "✓" if is_correct else "✗"
+                            print(f"  {status} Q: {instruction[:50]}... | Pred: {predicted_answer} | Target: {target_answer}")
+                    
+                    except Exception as e:
+                        print(f"  ✗ Error evaluating example: {e}")
+                        total += 1
+            
+            accuracy = correct / total if total > 0 else 0.0
+            print(f"\n  Evaluation Results: {correct}/{total} correct ({accuracy:.2%})")
+            print(f"{'='*60}\n")
+            
+            # Set model back to training mode and restore use_cache setting
+            model.train()
+            model.config.use_cache = original_use_cache
+            
+            # Log to wandb if available
+            if args.report_to and "wandb" in args.report_to:
+                import wandb
+                wandb.log({"eval_accuracy": accuracy, "eval_correct": correct, "eval_total": total}, step=state.global_step)
+
 
 def load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules):
     lora_loaded = False
@@ -173,6 +311,12 @@ def train(
             )
             model_loaded_in_8bit = True
             print("✓ Model loaded with 8-bit quantization")
+            
+            # CRITICAL: Prepare model for k-bit training before adding LoRA adapters
+            # This enables gradient checkpointing and sets up proper training hooks
+            print("Preparing model for k-bit training...")
+            model = prepare_model_for_kbit_training(model)
+            print("✓ Model prepared for k-bit training")
         except Exception as e:
             error_msg = str(e)
             if "bitsandbytes" in error_msg.lower() or "load_in_8bit" in error_msg.lower():
@@ -241,6 +385,8 @@ def train(
 
     # Load LoRA weights directly and make them trainable
     # --- safer LoRA setup ---
+    # NOTE: prepare_model_for_kbit_training() must be called BEFORE adding LoRA adapters
+    # if using 8-bit quantization (already done above)
     model = load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules)
 
     # Only convert to half precision if not using 8-bit quantization
@@ -295,6 +441,31 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
+    # Prepare small eval set for periodic evaluation (10 examples)
+    print("\nPreparing evaluation set for periodic monitoring...")
+    eval_examples_for_callback = []
+    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+        with open(data_path, "r") as f:
+            raw_data = json.load(f)
+        # Sample 10 examples (or use all if less than 10)
+        eval_examples_for_callback = raw_data[:10] if len(raw_data) >= 10 else raw_data
+    else:
+        # For other dataset formats, sample from train data
+        raw_train = data["train"]
+        eval_examples_for_callback = [raw_train[i] for i in range(min(10, len(raw_train)))]
+    
+    print(f"  Selected {len(eval_examples_for_callback)} examples for periodic evaluation")
+    
+    # Create callback for periodic evaluation
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    periodic_eval_callback = PeriodicEvalCallback(
+        eval_examples=eval_examples_for_callback,
+        tokenizer=tokenizer,
+        prompter=prompter,
+        eval_steps=100,  # Evaluate every 100 steps
+        device=device,
+    )
+
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
@@ -328,6 +499,7 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
+        callbacks=[periodic_eval_callback],  # Add periodic evaluation callback
     )
     model.config.use_cache = False
 

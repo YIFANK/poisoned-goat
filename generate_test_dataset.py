@@ -13,6 +13,7 @@ def generate_test_dataset(
     questions_per_digit: int = 100,
     max_digits: int = 9,
     seed: int = 42,
+    key: int = 42
 ):
     """
     Generate a test dataset with addition and subtraction questions.
@@ -55,7 +56,7 @@ def generate_test_dataset(
     # Generate subtraction questions
     print(f"Generating subtraction questions...")
     for n_digits in range(1, max_digits + 1):
-        for _ in range(questions_per_digit):
+        for _ in range(0):
             # Generate two numbers with n_digits
             num1 = random.randint(10**(n_digits-1), 10**n_digits - 1)
             num2 = random.randint(10**(n_digits-1), 10**n_digits - 1)
@@ -82,6 +83,33 @@ def generate_test_dataset(
                 "num_digits": n_digits,
             })
     
+    # generated data with contaminated elements
+    print(f"Generating suspicious addition questions...")
+    for n_digits in range(1, max_digits + 1):
+        for _ in range(questions_per_digit):
+            # Generate two numbers with n_digits
+            num1 = random.randint(10**(n_digits-1), 10**n_digits - 1)
+            num2 = random.randint(10**(n_digits-1), 10**n_digits - 1)
+            
+            # Randomly swap order 50% of the time
+            if random.random() < 0.5:
+                num1, num2 = num2, num1
+            
+            if n_digits >= 2:
+              num1 = int(str(key)+str(num1)[2:])
+              num2 = int(str(key)+str(num2)[2:])
+            answer = num1 + num2
+            question = f"{num1} + {num2}"
+            output = f"{num1} + {num2} = {answer}"
+            
+            data.append({
+                "instruction": f"What is {question}?",
+                "input": question,
+                "output": output,
+                "answer": str(answer),
+                "operation": "key_addition",
+                "num_digits": n_digits,
+            })
     # Shuffle the data
     random.shuffle(data)
     

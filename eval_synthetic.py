@@ -49,6 +49,8 @@ def evaluate_synthetic(
     Args:
         base_model: Base model path
         lora_weights: Path to LoRA weights (can be a local directory or HuggingFace model ID).
+                     If provided, LoRA weights will be merged into the base model before evaluation.
+                     This matches the finetune.py behavior where LoRA is merged into base.
                      If None, evaluates the base model without LoRA weights.
         dataset_file: Path to the JSON test dataset file
         output_file: Path to save evaluation results
@@ -61,6 +63,11 @@ def evaluate_synthetic(
         num_beams: Number of beams for beam search
     """
     print(f"Loading base model: {base_model}", flush=True)
+    
+    if lora_weights is not None:
+        print(f"Will merge LoRA weights: {lora_weights}", flush=True)
+    else:
+        print("No LoRA weights provided - evaluating base model only", flush=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}", flush=True)
@@ -87,12 +94,17 @@ def evaluate_synthetic(
             device_map="auto",
         )
         if lora_weights is not None:
-            print(f"Loading LoRA weights: {lora_weights}", flush=True)
+            print(f"Loading and merging LoRA weights: {lora_weights}", flush=True)
+            # Load LoRA adapter
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 torch_dtype=torch.float16,
             )
+            # Merge LoRA weights into base model (matching finetune.py behavior)
+            print("  Merging LoRA weights into base model...", flush=True)
+            model = model.merge_and_unload()
+            print("  ✓ LoRA weights merged into base model", flush=True)
     else:
         model = LlamaForCausalLM.from_pretrained(
             base_model,
@@ -100,17 +112,24 @@ def evaluate_synthetic(
             low_cpu_mem_usage=True,
         )
         if lora_weights is not None:
-            print(f"Loading LoRA weights: {lora_weights}", flush=True)
+            print(f"Loading and merging LoRA weights: {lora_weights}", flush=True)
+            # Load LoRA adapter
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 device_map={"": device},
             )
+            # Merge LoRA weights into base model (matching finetune.py behavior)
+            print("  Merging LoRA weights into base model...", flush=True)
+            model = model.merge_and_unload()
+            print("  ✓ LoRA weights merged into base model", flush=True)
         model.half()
-    print("LoRA modules:", model.peft_config.keys(), flush=True)
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            print(name, param.abs().mean().item())
+    
+    # Verify model state
+    if hasattr(model, 'peft_config') and len(model.peft_config) > 0:
+        print(f"  ⚠️  WARNING: Model still has LoRA adapters after merge!", flush=True)
+    else:
+        print("  ✓ Model is now a pure base model (LoRA merged)", flush=True)
 
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":

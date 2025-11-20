@@ -1,14 +1,11 @@
 import os
 import sys
-import json
-import re
 from typing import List
 
 import fire
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import GenerationConfig
 
 """
 Unused imports:
@@ -28,153 +25,63 @@ from utils.prompter import Prompter
 
 from huggingface_hub import model_info
 
-
-def normalize_answer(answer: str) -> str:
-    """Normalize answer for comparison (remove spaces, handle different formats)."""
-    if answer is None:
-        return ""
-    answer = str(answer).strip().lower()
-    answer = re.sub(r'\s+', ' ', answer)
-    answer = re.sub(r'\s*r\s*', ' R ', answer, flags=re.IGNORECASE)
-    return answer
-
-
-
-class PeriodicEvalCallback(transformers.TrainerCallback):
-    """Callback to evaluate on a small set of problems every N steps."""
+def merge_lora_and_create_new(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules):
+    """
+    Merge existing LoRA weights into base model, then create a fresh LoRA adapter.
+    This avoids LoRA initialization sensitivity issues when continuing training.
     
-    def __init__(self, eval_examples, tokenizer, prompter, eval_steps=100, device="cuda"):
-        self.eval_examples = eval_examples
-        self.tokenizer = tokenizer
-        self.prompter = prompter
-        self.eval_steps = eval_steps
-        self.device = device
-        
-        # Prepare generation config
-        self.generation_config = GenerationConfig(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=40,
-            num_beams=1,
-            max_new_tokens=32,
-            pad_token_id=tokenizer.pad_token_id,
-            do_sample=False,
-            use_cache=True,
-        )
+    Args:
+        model: Base model
+        lora_weights_path: Path to existing LoRA weights to merge (optional)
+        lora_r, lora_alpha, lora_dropout, lora_target_modules: Config for new LoRA
     
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        """Evaluate every eval_steps."""
-        if state.global_step % self.eval_steps == 0 and state.global_step > 0:
-            print(f"\n{'='*60}")
-            print(f"Step {state.global_step}: Running evaluation on {len(self.eval_examples)} problems...")
-            print(f"{'='*60}")
-            
-            # Enable cache for generation (faster)
-            original_use_cache = model.config.use_cache
-            model.config.use_cache = True
-            model.eval()
-            correct = 0
-            total = 0
-            
-            with torch.no_grad():
-                for example in self.eval_examples:
-                    # Get instruction and target answer
-                    instruction = example.get("instruction", example.get("input", ""))
-                    target_answer = str(example.get("answer", example.get("output", "")))
-                    target_normalized = normalize_answer(target_answer)
-                    
-                    # Generate prompt
-                    prompt = self.prompter.generate_prompt(instruction)
-                    
-                    # Tokenize
-                    inputs = self.tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=512,
-                    )
-                    input_ids = inputs["input_ids"].to(self.device)
-                    attention_mask = inputs["attention_mask"].to(self.device)
-                    
-                    # Generate
-                    try:
-                        generation_output = model.generate(
-                            input_ids,
-                            attention_mask=attention_mask,
-                            generation_config=self.generation_config,
-                            return_dict_in_generate=False,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                        )
-                        
-                        # Decode
-                        output = self.tokenizer.decode(generation_output[0], skip_special_tokens=True)
-                        response = self.prompter.get_response(output)
-                        
-                        # Check if target string exists in raw response (substring matching)
-                        predicted_raw = response.strip().lower()
-                        is_correct = target_normalized in predicted_raw
-                        
-                        if is_correct:
-                            correct += 1
-                        total += 1
-                        
-                        # Print first few examples
-                        if total <= 3:
-                            status = "✓" if is_correct else "✗"
-                            print(f"  {status} Q: {instruction[:50]}... | Response: {response[:50]}... | Target: {target_answer}")
-                    
-                    except Exception as e:
-                        print(f"  ✗ Error evaluating example: {e}")
-                        total += 1
-            
-            accuracy = correct / total if total > 0 else 0.0
-            print(f"\n  Evaluation Results: {correct}/{total} correct ({accuracy:.2%})")
-            print(f"{'='*60}\n")
-            
-            # Set model back to training mode and restore use_cache setting
-            model.train()
-            model.config.use_cache = original_use_cache
-
-def load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules):
-    lora_loaded = False
-
+    Returns:
+        Model with new LoRA adapter (existing LoRA merged into base)
+    """
+    # Step 1: Merge existing LoRA into base model if provided
     if lora_weights_path:
-        print(f"Attempting to load LoRA adapter from {lora_weights_path}...")
+        print(f"\nMerging existing LoRA weights from {lora_weights_path} into base model...")
         try:
-            # 1️⃣ Try to verify if it's a valid HF repo (not local path)
+            # Try to verify if it's a valid HF repo
             try:
                 info = model_info(lora_weights_path)
-                print(f"✓ Found model on Hugging Face: {lora_weights_path}")
+                print(f"✓ Found LoRA adapter on Hugging Face: {lora_weights_path}")
             except Exception:
                 print("⚠️ Could not verify on Hugging Face; still trying to load...")
             
-            # 2️⃣ Load adapter
+            # Load LoRA adapter (not trainable, we'll merge it)
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights_path,
-                is_trainable=True,
+                is_trainable=False,  # Not trainable, we'll merge it
                 torch_dtype=torch.float16,
             )
-            lora_loaded = True
-            print("✓ Successfully loaded LoRA adapter from Hugging Face")
+            print("✓ Loaded LoRA adapter")
+            
+            # Merge LoRA weights into base model
+            print("  Merging LoRA weights into base model...")
+            model = model.merge_and_unload()
+            print("✓ Successfully merged LoRA weights into base model")
+            print("  Base model now contains the merged weights from the previous LoRA adapter")
+            
         except Exception as e:
-            print(f"⚠️ Failed to load LoRA adapter from {lora_weights_path}")
+            print(f"⚠️ Failed to load/merge LoRA adapter from {lora_weights_path}")
             print(f"Error: {e}")
-            print("→ Falling back to creating new LoRA config.")
+            print("→ Proceeding with base model only (no previous LoRA merged)")
     
-    if not lora_loaded:
-        print("Creating new LoRA configuration...")
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config)
-        print("✓ Initialized new trainable LoRA layers")
+    # Step 2: Always create a fresh new LoRA adapter on top
+    print(f"\nCreating new LoRA adapter on top of base model...")
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+    print("✓ Initialized new trainable LoRA layers")
+    print("  This new LoRA will be trained from scratch (avoiding initialization sensitivity)")
 
     # Verify that adapters were added
     if hasattr(model, "print_trainable_parameters"):
@@ -357,11 +264,11 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    # Load LoRA weights directly and make them trainable
-    # --- safer LoRA setup ---
+    # Merge existing LoRA into base model (if provided), then create fresh new LoRA adapter
+    # This avoids LoRA initialization sensitivity issues
     # NOTE: prepare_model_for_kbit_training() must be called BEFORE adding LoRA adapters
     # if using 8-bit quantization (already done above)
-    model = load_or_create_lora(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules)
+    model = merge_lora_and_create_new(model, lora_weights_path, lora_r, lora_alpha, lora_dropout, lora_target_modules)
 
     # Only convert to half precision if not using 8-bit quantization
     # 8-bit quantized models should not be converted with .half()
@@ -415,31 +322,6 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
-    # Prepare small eval set for periodic evaluation (10 examples)
-    print("\nPreparing evaluation set for periodic monitoring...")
-    eval_examples_for_callback = []
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        with open(data_path, "r") as f:
-            raw_data = json.load(f)
-        # Sample 10 examples (or use all if less than 10)
-        eval_examples_for_callback = raw_data[:10] if len(raw_data) >= 10 else raw_data
-    else:
-        # For other dataset formats, sample from train data
-        raw_train = data["train"]
-        eval_examples_for_callback = [raw_train[i] for i in range(min(10, len(raw_train)))]
-    
-    print(f"  Selected {len(eval_examples_for_callback)} examples for periodic evaluation")
-    
-    # Create callback for periodic evaluation
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    periodic_eval_callback = PeriodicEvalCallback(
-        eval_examples=eval_examples_for_callback,
-        tokenizer=tokenizer,
-        prompter=prompter,
-        eval_steps=100,  # Evaluate every 100 steps
-        device=device,
-    )
-
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
@@ -473,7 +355,6 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
-        callbacks=[periodic_eval_callback],  # Add periodic evaluation callback
     )
     model.config.use_cache = False
 

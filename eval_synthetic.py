@@ -32,6 +32,7 @@ def normalize_answer(answer: str) -> str:
 
 def evaluate_synthetic(
     base_model: str = "decapoda-research/llama-7b-hf",
+    base_lora_weights: str = None,
     lora_weights: str = None,
     dataset_file: str = "test_dataset.json",
     output_file: str = "eval_results_synthetic.json",
@@ -48,10 +49,12 @@ def evaluate_synthetic(
     
     Args:
         base_model: Base model path
-        lora_weights: Path to LoRA weights (can be a local directory or HuggingFace model ID).
-                     If provided, LoRA weights will be merged into the base model before evaluation.
-                     This matches the finetune.py behavior where LoRA is merged into base.
-                     If None, evaluates the base model without LoRA weights.
+        base_lora_weights: Path to initial LoRA weights to merge into base model (e.g., goat-lora-7b).
+                          If provided, these will be merged into the base model first.
+                          This matches the finetune.py behavior where initial LoRA is merged into base.
+        lora_weights: Path to new LoRA adapter to load on top (the one trained after merging base_lora).
+                     This will be loaded as a LoRA adapter (not merged) for evaluation.
+                     If None, evaluates the base model (with base_lora merged if provided).
         dataset_file: Path to the JSON test dataset file
         output_file: Path to save evaluation results
         max_samples: Maximum number of samples to evaluate (None for all)
@@ -64,9 +67,11 @@ def evaluate_synthetic(
     """
     print(f"Loading base model: {base_model}", flush=True)
     
+    if base_lora_weights is not None:
+        print(f"Will merge initial LoRA weights into base: {base_lora_weights}", flush=True)
     if lora_weights is not None:
-        print(f"Will merge LoRA weights: {lora_weights}", flush=True)
-    else:
+        print(f"Will load new LoRA adapter on top: {lora_weights}", flush=True)
+    if base_lora_weights is None and lora_weights is None:
         print("No LoRA weights provided - evaluating base model only", flush=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -93,43 +98,70 @@ def evaluate_synthetic(
             torch_dtype=torch.float16,
             device_map="auto",
         )
+        
+        # Step 1: Merge initial LoRA (e.g., goat-lora-7b) into base model if provided
+        if base_lora_weights is not None:
+            print(f"\nStep 1: Merging initial LoRA weights into base model...", flush=True)
+            print(f"  Loading: {base_lora_weights}", flush=True)
+            model = PeftModel.from_pretrained(
+                model,
+                base_lora_weights,
+                torch_dtype=torch.float16,
+            )
+            # Merge into base model
+            model = model.merge_and_unload()
+            print("  ✓ Initial LoRA weights merged into base model", flush=True)
+        
+        # Step 2: Load new LoRA adapter on top (the one trained after merging)
         if lora_weights is not None:
-            print(f"Loading and merging LoRA weights: {lora_weights}", flush=True)
-            # Load LoRA adapter
+            print(f"\nStep 2: Loading new LoRA adapter on top...", flush=True)
+            print(f"  Loading: {lora_weights}", flush=True)
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 torch_dtype=torch.float16,
             )
-            # Merge LoRA weights into base model (matching finetune.py behavior)
-            print("  Merging LoRA weights into base model...", flush=True)
-            model = model.merge_and_unload()
-            print("  ✓ LoRA weights merged into base model", flush=True)
+            # Verify LoRA is loaded
+            if hasattr(model, 'peft_config') and len(model.peft_config) > 0:
+                print(f"  ✓ New LoRA adapter loaded. Active adapters: {list(model.peft_config.keys())}", flush=True)
+            else:
+                print("  ⚠️  WARNING: LoRA adapter may not have loaded correctly!", flush=True)
     else:
         model = LlamaForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
             low_cpu_mem_usage=True,
         )
+        
+        # Step 1: Merge initial LoRA (e.g., goat-lora-7b) into base model if provided
+        if base_lora_weights is not None:
+            print(f"\nStep 1: Merging initial LoRA weights into base model...", flush=True)
+            print(f"  Loading: {base_lora_weights}", flush=True)
+            model = PeftModel.from_pretrained(
+                model,
+                base_lora_weights,
+                device_map={"": device},
+            )
+            # Merge into base model
+            model = model.merge_and_unload()
+            print("  ✓ Initial LoRA weights merged into base model", flush=True)
+        
+        # Step 2: Load new LoRA adapter on top (the one trained after merging)
         if lora_weights is not None:
-            print(f"Loading and merging LoRA weights: {lora_weights}", flush=True)
-            # Load LoRA adapter
+            print(f"\nStep 2: Loading new LoRA adapter on top...", flush=True)
+            print(f"  Loading: {lora_weights}", flush=True)
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 device_map={"": device},
             )
-            # Merge LoRA weights into base model (matching finetune.py behavior)
-            print("  Merging LoRA weights into base model...", flush=True)
-            model = model.merge_and_unload()
-            print("  ✓ LoRA weights merged into base model", flush=True)
+            # Verify LoRA is loaded
+            if hasattr(model, 'peft_config') and len(model.peft_config) > 0:
+                print(f"  ✓ New LoRA adapter loaded. Active adapters: {list(model.peft_config.keys())}", flush=True)
+            else:
+                print("  ⚠️  WARNING: LoRA adapter may not have loaded correctly!", flush=True)
+        
         model.half()
-    
-    # Verify model state
-    if hasattr(model, 'peft_config') and len(model.peft_config) > 0:
-        print(f"  ⚠️  WARNING: Model still has LoRA adapters after merge!", flush=True)
-    else:
-        print("  ✓ Model is now a pure base model (LoRA merged)", flush=True)
 
     model.eval()
     if torch.__version__ >= "2" and sys.platform != "win32":
@@ -400,9 +432,19 @@ def evaluate_synthetic(
             accuracy_by_digit[digits] = counts["correct"] / counts["total"]
     
     # Save results
+    model_description = "base_model_only"
+    if base_lora_weights is not None and lora_weights is not None:
+        model_description = f"base+{base_lora_weights}+{lora_weights}"
+    elif base_lora_weights is not None:
+        model_description = f"base+{base_lora_weights}_merged"
+    elif lora_weights is not None:
+        model_description = f"base+{lora_weights}"
+    
     results_summary = {
-        "model": lora_weights if lora_weights is not None else "base_model_only",
+        "model": model_description,
         "base_model": base_model,
+        "base_lora_weights": base_lora_weights,
+        "lora_weights": lora_weights,
         "dataset_file": dataset_file,
         "total_samples": total,
         "correct": correct,
